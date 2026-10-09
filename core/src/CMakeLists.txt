@@ -1,0 +1,37 @@
+target_include_directories(recon_fn PRIVATE ${CMAKE_CURRENT_LIST_DIR})
+target_sources(recon_fn PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/dma.c
+    ${CMAKE_CURRENT_LIST_DIR}/ipc.c
+    ${CMAKE_CURRENT_LIST_DIR}/math.c
+    ${CMAKE_CURRENT_LIST_DIR}/rtc.c
+    ${CMAKE_CURRENT_LIST_DIR}/timers.c
+)
+include(${CMAKE_CURRENT_LIST_DIR}/cart/CMakeLists.txt)
+include(${CMAKE_CURRENT_LIST_DIR}/core/CMakeLists.txt)
+include(${CMAKE_CURRENT_LIST_DIR}/cpu/CMakeLists.txt)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64" OR CMAKE_C_COMPILER_TARGET MATCHES "aarch64")
+    include(${CMAKE_CURRENT_LIST_DIR}/cpu/jit-arm64/CMakeLists.txt)
+elseif(SEEDLESS_LIBRETRO)
+    message(STATUS "cpu/jit-arm64: skipped (non-AArch64 libretro stub)")
+else()
+    include(${CMAKE_CURRENT_LIST_DIR}/cpu/jit-arm64/CMakeLists.txt)
+endif()
+include(${CMAKE_CURRENT_LIST_DIR}/debug/CMakeLists.txt)
+include(${CMAKE_CURRENT_LIST_DIR}/frontend/CMakeLists.txt)
+include(${CMAKE_CURRENT_LIST_DIR}/frontend/archive/CMakeLists.txt)
+include(${CMAKE_CURRENT_LIST_DIR}/frontend/cheats/CMakeLists.txt)
+include(${CMAKE_CURRENT_LIST_DIR}/frontend/script/CMakeLists.txt)
+include(${CMAKE_CURRENT_LIST_DIR}/gpu/CMakeLists.txt)
+include(${CMAKE_CURRENT_LIST_DIR}/gpu/gpu2d/CMakeLists.txt)
+include(${CMAKE_CURRENT_LIST_DIR}/gpu/gpu3d/CMakeLists.txt)
+include(${CMAKE_CURRENT_LIST_DIR}/gpu/gpu3d/raster/CMakeLists.txt)
+include(${CMAKE_CURRENT_LIST_DIR}/memory/CMakeLists.txt)
+include(${CMAKE_CURRENT_LIST_DIR}/platform/CMakeLists.txt)
+if(ANDROID AND NOT SEEDLESS_LIBRETRO)
+    include(${CMAKE_CURRENT_LIST_DIR}/platform/android/CMakeLists.txt)
+elseif(NOT SEEDLESS_LIBRETRO AND NOT SEEDLESS_SKIP_ANDROID_PLATFORM)
+    include(${CMAKE_CURRENT_LIST_DIR}/platform/android/CMakeLists.txt)
+endif()
+include(${CMAKE_CURRENT_LIST_DIR}/spi/CMakeLists.txt)
+include(${CMAKE_CURRENT_LIST_DIR}/spu/CMakeLists.txt)
+include(${CMAKE_CURRENT_LIST_DIR}/util/CMakeLists.txt)
