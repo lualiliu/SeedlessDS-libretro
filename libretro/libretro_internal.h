@@ -17,6 +17,7 @@ extern "C" {
 void seedless_audio_reset(void);
 size_t seedless_audio_read(int16_t *out, size_t max_frames);
 size_t seedless_audio_frames_available(void);
+void seedless_audio_mark_consumed(size_t frames);
 
 void seedless_compat_init(void);
 

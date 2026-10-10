@@ -30,4 +30,4 @@ firmware4_desc = "nds_firmware_modified.bin (NDS Firmware)"
 firmware4_path = "nds_firmware_modified.bin"
 firmware4_opt = "true"
 
-description = "Libretro port of SeedlessDS-Core (DraStic reconstruction). AArch64 only (JIT). Dual screens are stacked vertically (256x384). Touch the lower screen with a pointer/mouse. L3 closes the lid."
+description = "Libretro port of SeedlessDS-Core (DraStic reconstruction). AArch64 only (JIT). Dual screens are stacked vertically (256x384). Touch the lower screen with a pointer/mouse. Right stick moves a virtual stylus; L3 presses touch. Core options map DraStic/Seedless settings (frameskip, hires 3D, audio, saves, Slot-2, etc.)."

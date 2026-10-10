@@ -3,18 +3,23 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <pthread.h>
 #include <sched.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include <libretro.h>
 #include "libretro_internal.h"
+#include "libretro_core_options.h"
 
 #include "seedlessds/nds.h"
 #include "seedlessds/platform.h"
 
 /* Internal core symbols (not in public headers). */
 void recon_present_set_mode(unsigned mode);
+extern unsigned recon_present_flips;
+extern unsigned recon_present_seen;
 #define RECON_PRESENT_PREDICATE 1u
 #define RECON_PRESENT_NO_UPLOAD 4u
 
@@ -31,11 +36,22 @@ static retro_input_state_t input_state_cb;
 
 static nds_t *g_nds;
 static pthread_t g_emu_thread;
-static int g_emu_running;
-static int g_emu_started;
+/* Shared with emu thread — must be volatile or the wait loop is optimized
+ * into an infinite sched_yield (black screen, menu unresponsive). */
+static volatile int g_emu_running;
+static volatile int g_emu_started;
 static char g_rom_path[4096];
 static char g_system_dir[4096];
 static char g_save_dir[4096];
+static uint64_t g_config_bits;
+static bool g_libretro_supports_option_categories;
+/* Virtual stylus for devices without a touchscreen: right stick moves,
+ * L3 presses. Coordinates are on the lower DS screen (0..W-1, 0..H-1). */
+static float g_stylus_x = (float)(SEEDLESS_SCREEN_W / 2);
+static float g_stylus_y = (float)(SEEDLESS_SCREEN_H / 2);
+static int g_stylus_touching;
+#define STYLUS_DEADZONE 0x1800
+#define STYLUS_SPEED_PX 4.5f
 
 static uint32_t g_frame[SEEDLESS_SCREEN_W * SEEDLESS_FB_H];
 static uint32_t g_top[SEEDLESS_SCREEN_W * SEEDLESS_SCREEN_H];
@@ -103,6 +119,150 @@ static void install_system_file(const char *name)
     fclose(out);
 }
 
+static const char *opt_value(const char *key, const char *fallback)
+{
+    struct retro_variable var;
+
+    var.key = key;
+    var.value = NULL;
+    if (environ_cb && environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) &&
+        var.value && *var.value)
+        return var.value;
+    return fallback;
+}
+
+static int opt_enabled(const char *key, int default_on)
+{
+    const char *v = opt_value(key, default_on ? "enabled" : "disabled");
+    return strcmp(v, "enabled") == 0 || strcmp(v, "true") == 0 ||
+           strcmp(v, "1") == 0;
+}
+
+static unsigned opt_unsigned(const char *key, unsigned fallback)
+{
+    const char *v = opt_value(key, NULL);
+    char *end = NULL;
+    unsigned long n;
+
+    if (!v)
+        return fallback;
+    n = strtoul(v, &end, 10);
+    if (end == v)
+        return fallback;
+    return (unsigned)n;
+}
+
+/* Pack DraStic/Seedless config_bits from libretro core options.
+ * Layout matches core/src/core/config.c config_unpack_word(). */
+static uint64_t build_config_bits(void)
+{
+    uint64_t bits = 0;
+    const char *fs_type = opt_value("seedlessds_frameskip_type", "none");
+    const char *latency = opt_value("seedlessds_audio_latency", "low");
+    unsigned fs_val = opt_unsigned("seedlessds_frameskip_value", 4);
+    unsigned volume = opt_unsigned("seedlessds_audio_volume", 1);
+    unsigned threads = opt_unsigned("seedlessds_thread_count", 8);
+    unsigned profile = opt_unsigned("seedlessds_button_profile", 0);
+    unsigned slot2 = opt_unsigned("seedlessds_slot2", 0);
+    unsigned fs_enc;
+
+    if (fs_val > 9)
+        fs_val = 9;
+    if (volume > 3)
+        volume = 3;
+    if (threads > 15)
+        threads = 15;
+    if (profile > 7)
+        profile = 7;
+    if (slot2 > 15)
+        slot2 = 15;
+
+    /* bits 0-3: frameskip value */
+    bits |= (uint64_t)fs_val & 0xfull;
+
+    /* bits 5-6: frameskip type encoding
+     *   1 → none (type 0), 2 → manual (type 1), 0/3 → auto (type 2) */
+    if (strcmp(fs_type, "none") == 0)
+        fs_enc = 1;
+    else if (strcmp(fs_type, "manual") == 0)
+        fs_enc = 2;
+    else
+        fs_enc = 0;
+    bits |= (uint64_t)(fs_enc & 3u) << 5;
+
+    /* bits 8-9: audio latency mode */
+    if (strcmp(latency, "medium") == 0)
+        bits |= 1ull << 8;
+    else if (strcmp(latency, "high") == 0)
+        bits |= 2ull << 8;
+
+    /* bits 16-19: compose thread count */
+    bits |= (uint64_t)(threads & 0xfu) << 16;
+
+    if (opt_enabled("seedlessds_screen_16bit", 0))
+        bits |= 1ull << 23; /* FRONTEND_CONFIG_SCREENSHOT_SWAP_RB */
+    if (opt_enabled("seedlessds_ignore_gamecard_limit", 0))
+        bits |= 1ull << 24;
+    if (opt_enabled("seedlessds_savestate_extra", 0))
+        bits |= 1ull << 25;
+    if (opt_enabled("seedlessds_mic_audio_path", 1))
+        bits |= 1ull << 26; /* audio_out_enabled */
+    if (opt_enabled("seedlessds_cheats", 1))
+        bits |= 1ull << 27;
+    if (opt_enabled("seedlessds_threaded_3d", 0))
+        bits |= 1ull << 28;
+    if (opt_enabled("seedlessds_show_fps", 0))
+        bits |= 1ull << 30;
+    if (opt_enabled("seedlessds_sound", 1))
+        bits |= 1ull << 31;
+
+    bits |= (uint64_t)(profile & 7u) << 32;
+
+    if (opt_enabled("seedlessds_fix_main_screen", 0))
+        bits |= 1ull << 35;
+    if (opt_enabled("seedlessds_auto_trim", 0))
+        bits |= 1ull << 36;
+
+    bits |= (uint64_t)(volume & 3u) << 37;
+
+    if (opt_enabled("seedlessds_rtc_system_time", 1))
+        bits |= 1ull << 39;
+    if (opt_enabled("seedlessds_disable_edge_marking", 0))
+        bits |= 1ull << 40;
+    if (opt_enabled("seedlessds_hires_3d", 0))
+        bits |= 1ull << 41;
+    if (opt_enabled("seedlessds_lua", 0))
+        bits |= 1ull << 42;
+
+    bits |= (uint64_t)(slot2 & 0xfu) << 43;
+
+    if (opt_enabled("seedlessds_frameskip_safe", 0))
+        bits |= 1ull << 47;
+    if (opt_enabled("seedlessds_preload_roms", 0))
+        bits |= 1ull << 48;
+    if (opt_enabled("seedlessds_raw_sav", 0))
+        bits |= 1ull << 50;
+
+    return bits;
+}
+
+static void apply_core_options(int runtime)
+{
+    g_config_bits = build_config_bits();
+    if (runtime && g_nds)
+        nds_apply_config(g_nds, g_config_bits);
+}
+
+static void check_variables(void)
+{
+    bool updated = false;
+
+    if (environ_cb &&
+        environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) &&
+        updated)
+        apply_core_options(1);
+}
+
 static void set_seedless_root(void)
 {
     const char *sys = NULL;
@@ -141,8 +301,7 @@ static void *emu_thread_main(void *arg)
     memset(&open, 0, sizeof open);
     open.path = g_rom_path;
     open.state_slot = -1;
-    open.config_bits = 0;
-    /* Keep soft RGBA path (bit 23 clear = 32-bit screens). */
+    open.config_bits = g_config_bits;
 
     g_emu_started = 1;
     if (!nds_load_rom(g_nds, &open)) {
@@ -193,12 +352,73 @@ static uint32_t poll_keys(void)
     P(RETRO_DEVICE_ID_JOYPAD_SELECT, FE_SELECT);
 #undef P
 
-    if (input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L3))
-        nds_hinge(g_nds, 1);
-    else
-        nds_hinge(g_nds, 0);
-
     return keys;
+}
+
+static void clamp_stylus(void)
+{
+    if (g_stylus_x < 0.0f)
+        g_stylus_x = 0.0f;
+    if (g_stylus_y < 0.0f)
+        g_stylus_y = 0.0f;
+    if (g_stylus_x > (float)(SEEDLESS_SCREEN_W - 1))
+        g_stylus_x = (float)(SEEDLESS_SCREEN_W - 1);
+    if (g_stylus_y > (float)(SEEDLESS_SCREEN_H - 1))
+        g_stylus_y = (float)(SEEDLESS_SCREEN_H - 1);
+}
+
+static void move_stylus_from_stick(unsigned index)
+{
+    int16_t ax = input_state_cb(0, RETRO_DEVICE_ANALOG, index,
+                                RETRO_DEVICE_ID_ANALOG_X);
+    int16_t ay = input_state_cb(0, RETRO_DEVICE_ANALOG, index,
+                                RETRO_DEVICE_ID_ANALOG_Y);
+    float fx, fy, mag;
+
+    if (ax > -STYLUS_DEADZONE && ax < STYLUS_DEADZONE)
+        ax = 0;
+    if (ay > -STYLUS_DEADZONE && ay < STYLUS_DEADZONE)
+        ay = 0;
+    if (ax == 0 && ay == 0)
+        return;
+
+    fx = (float)ax / 32767.0f;
+    fy = (float)ay / 32767.0f;
+    mag = fx * fx + fy * fy;
+    if (mag > 1.0f) {
+        mag = sqrtf(mag);
+        fx /= mag;
+        fy /= mag;
+    }
+    g_stylus_x += fx * STYLUS_SPEED_PX;
+    g_stylus_y += fy * STYLUS_SPEED_PX;
+    clamp_stylus();
+}
+
+static void put_fb_px(uint32_t *fb, int x, int y, uint32_t color)
+{
+    if (x < 0 || y < 0 || x >= SEEDLESS_SCREEN_W || y >= SEEDLESS_FB_H)
+        return;
+    fb[y * SEEDLESS_SCREEN_W + x] = color;
+}
+
+static void draw_stylus_cursor(uint32_t *fb, int touching)
+{
+    int cx = (int)(g_stylus_x + 0.5f);
+    int cy = (int)(g_stylus_y + 0.5f) + SEEDLESS_SCREEN_H;
+    uint32_t ink = touching ? 0x00FF4040u : 0x00F0F0F0u;
+    uint32_t edge = 0x00101010u;
+    int i;
+
+    for (i = -7; i <= 7; i++) {
+        put_fb_px(fb, cx + i, cy - 1, edge);
+        put_fb_px(fb, cx + i, cy + 1, edge);
+        put_fb_px(fb, cx - 1, cy + i, edge);
+        put_fb_px(fb, cx + 1, cy + i, edge);
+        put_fb_px(fb, cx + i, cy, ink);
+        put_fb_px(fb, cx, cy + i, ink);
+    }
+    put_fb_px(fb, cx, cy, touching ? 0x00FFFFFFu : 0x00FF2020u);
 }
 
 static void poll_touch(nds_input_t *input)
@@ -211,10 +431,27 @@ static void poll_touch(nds_input_t *input)
     int16_t my = input_state_cb(0, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_Y);
     int16_t mbtn =
         input_state_cb(0, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_LEFT);
+    int l3 = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0,
+                            RETRO_DEVICE_ID_JOYPAD_L3) != 0;
 
     input->touch_down = 0;
     input->touch_x = 0;
     input->touch_y = 0;
+    g_stylus_touching = 0;
+
+    /* Right stick moves the virtual stylus; left stick as fallback. */
+    move_stylus_from_stick(RETRO_DEVICE_INDEX_ANALOG_RIGHT);
+    {
+        int16_t rx = input_state_cb(0, RETRO_DEVICE_ANALOG,
+                                    RETRO_DEVICE_INDEX_ANALOG_RIGHT,
+                                    RETRO_DEVICE_ID_ANALOG_X);
+        int16_t ry = input_state_cb(0, RETRO_DEVICE_ANALOG,
+                                    RETRO_DEVICE_INDEX_ANALOG_RIGHT,
+                                    RETRO_DEVICE_ID_ANALOG_Y);
+        if ((rx > -STYLUS_DEADZONE && rx < STYLUS_DEADZONE) &&
+            (ry > -STYLUS_DEADZONE && ry < STYLUS_DEADZONE))
+            move_stylus_from_stick(RETRO_DEVICE_INDEX_ANALOG_LEFT);
+    }
 
     if (pressed) {
         /* Pointer is [-0x7fff, 0x7fff] over the full framebuffer. */
@@ -224,6 +461,9 @@ static void poll_touch(nds_input_t *input)
             input->touch_down = 1;
             input->touch_x = x;
             input->touch_y = y - SEEDLESS_SCREEN_H;
+            g_stylus_x = (float)input->touch_x;
+            g_stylus_y = (float)input->touch_y;
+            g_stylus_touching = 1;
         }
     } else if (mbtn) {
         static int abs_x, abs_y;
@@ -241,7 +481,16 @@ static void poll_touch(nds_input_t *input)
             input->touch_down = 1;
             input->touch_x = abs_x;
             input->touch_y = abs_y - SEEDLESS_SCREEN_H;
+            g_stylus_x = (float)input->touch_x;
+            g_stylus_y = (float)input->touch_y;
+            g_stylus_touching = 1;
         }
+    } else if (l3) {
+        /* L3 = stylus press at the virtual pointer. */
+        input->touch_down = 1;
+        input->touch_x = (int)(g_stylus_x + 0.5f);
+        input->touch_y = (int)(g_stylus_y + 0.5f);
+        g_stylus_touching = 1;
     }
 }
 
@@ -263,6 +512,8 @@ static void present_video(void)
         g_frame[i + SEEDLESS_SCREEN_W * SEEDLESS_SCREEN_H] = g_bottom[i];
     }
 
+    draw_stylus_cursor(g_frame, g_stylus_touching);
+
     video_cb(g_frame, SEEDLESS_SCREEN_W, SEEDLESS_FB_H,
              SEEDLESS_SCREEN_W * sizeof(uint32_t));
 }
@@ -272,16 +523,22 @@ static void present_audio(void)
     size_t avail = seedless_audio_frames_available();
     size_t want = (SEEDLESS_AUDIO_RATE / 60);
     size_t n;
+    size_t real_n;
 
-    if (avail > sizeof g_audio_tmp / (2 * sizeof(int16_t)))
-        avail = sizeof g_audio_tmp / (2 * sizeof(int16_t));
+    if (want > sizeof g_audio_tmp / (2 * sizeof(int16_t)))
+        want = sizeof g_audio_tmp / (2 * sizeof(int16_t));
+    if (avail > want)
+        avail = want;
 
     n = seedless_audio_read(g_audio_tmp, avail);
-    if (n == 0) {
-        /* Keep frontend clocked if the stub has not filled yet. */
-        memset(g_audio_tmp, 0, want * 2 * sizeof(int16_t));
+    real_n = n;
+    if (n < want) {
+        /* Pad to one video-frame of audio so RetroArch stays clocked. */
+        memset(g_audio_tmp + n * 2, 0, (want - n) * 2 * sizeof(int16_t));
         n = want;
     }
+    if (real_n > 0)
+        seedless_audio_mark_consumed(real_n);
     if (audio_batch_cb)
         audio_batch_cb(g_audio_tmp, n);
     else if (audio_cb) {
@@ -304,6 +561,7 @@ void retro_set_environment(retro_environment_t cb)
     else
         log_cb = log_fallback;
 
+    libretro_set_core_options(cb, &g_libretro_supports_option_categories);
     cb(RETRO_ENVIRONMENT_SET_SUPPORT_NO_GAME, &no_content);
 }
 
@@ -371,9 +629,12 @@ void retro_reset(void)
 void retro_run(void)
 {
     nds_input_t input;
+    int ms;
 
     if (!g_nds || !g_emu_running)
         return;
+
+    check_variables();
 
     input_poll_cb();
     memset(&input, 0, sizeof input);
@@ -382,8 +643,15 @@ void retro_run(void)
     poll_touch(&input);
     nds_input_set(g_nds, &input);
 
-    /* Wait for the emu thread to flip a completed frame. */
-    nds_wait_screen(g_nds);
+    /* Bounded wait: never block RetroArch's menu / input forever if the
+     * emu thread stalls before producing a flip. */
+    for (ms = 0; ms < 32; ms++) {
+        if (recon_present_seen != recon_present_flips) {
+            nds_wait_screen(g_nds);
+            break;
+        }
+        usleep(1000);
+    }
 
     present_video();
     present_audio();
@@ -481,23 +749,30 @@ bool retro_load_game(const struct retro_game_info *info)
         {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_RIGHT, "Right"},
         {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L, "L"},
         {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R, "R"},
-        {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L3, "Close lid"},
+        {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L3,
+         "Virtual stylus touch"},
+        {0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT,
+         RETRO_DEVICE_ID_ANALOG_X, "Virtual stylus X"},
+        {0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT,
+         RETRO_DEVICE_ID_ANALOG_Y, "Virtual stylus Y"},
         {0, 0, 0, 0, NULL},
     };
 
     if (!info || !info->path)
         return false;
-/*
+
 #if !defined(__aarch64__) && !defined(__arm64__)
     if (log_cb)
         log_cb(RETRO_LOG_ERROR,
-               CORE_NAME ": SeedlessDS-Core JIT requires AArch64\n");
+               CORE_NAME ": SeedlessDS-Core JIT requires AArch64; "
+               "this x86_64 build cannot run games\n");
     return false;
 #endif
-*/
+
     environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt);
     environ_cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, desc);
     set_seedless_root();
+    apply_core_options(0);
 
     snprintf(g_rom_path, sizeof g_rom_path, "%s", info->path);
 
@@ -510,6 +785,10 @@ bool retro_load_game(const struct retro_game_info *info)
 
     recon_present_set_mode(RECON_PRESENT_PREDICATE | RECON_PRESENT_NO_UPLOAD);
     seedless_audio_reset();
+    nds_apply_config(g_nds, g_config_bits);
+    g_stylus_x = (float)(SEEDLESS_SCREEN_W / 2);
+    g_stylus_y = (float)(SEEDLESS_SCREEN_H / 2);
+    g_stylus_touching = 0;
 
     g_emu_running = 1;
     g_emu_started = 0;
@@ -521,8 +800,9 @@ bool retro_load_game(const struct retro_game_info *info)
     }
 
     /* Wait until the worker has entered nds_load_rom. */
-    while (g_emu_running && !g_emu_started)
+    while (g_emu_running && !g_emu_started) {
         sched_yield();
+    }
 
     if (log_cb)
         log_cb(RETRO_LOG_INFO, CORE_NAME ": loaded %s (%s)\n", g_rom_path,

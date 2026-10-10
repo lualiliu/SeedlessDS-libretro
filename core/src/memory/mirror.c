@@ -7,6 +7,14 @@
 #include "dma.h"
 #include <string.h>
 #include <stddef.h>
+#if defined(SEEDLESS_LIBRETRO)
+#include <sys/mman.h>
+#include <unistd.h>
+/* Linux needs MAP_FIXED to replace a hole at an exact address. */
+#define MIRROR_MAP_REMAP (MAP_SHARED | MAP_FIXED)
+#else
+#define MIRROR_MAP_REMAP 1
+#endif
 #include "platform/android/audio.h"
 #include "core_internals.h"
 #include "mem_access.h"
@@ -43,7 +51,28 @@ typedef int32_t (*fn_close)(int32_t);
 typedef int32_t (*fn_asharedmem_create)(const char *, uint32_t);
 
 int32_t mirror_shm_create(const char *name, uint32_t size, int32_t level_api) {
+#if defined(SEEDLESS_LIBRETRO)
+    /* Desktop/libretro: no ashmem / ASharedMemory. Use memfd.
+     * Callers first probe with a small size then mmap a larger window;
+     * ashmem rejects that mmap, but Linux memfd allows it and would
+     * SIGBUS on touch — round known probe sizes up to the real map. */
+    (void)level_api;
+    if (size == 0x414000u)
+        size = 0x4000000u;
+    else if (size == 0xa8000u)
+        size = 0x800000u;
 
+    {
+        int32_t fd = (int32_t)memfd_create(name ? name : "seedless", MFD_CLOEXEC);
+        if (fd < 0)
+            return fd;
+        if (ftruncate(fd, (off_t)size) != 0) {
+            close(fd);
+            return -1;
+        }
+        return fd;
+    }
+#else
     static fn_dlopen  p_dlopen;
     static fn_dlsym   p_dlsym;
     static fn_dlclose p_dlclose;
@@ -90,6 +119,7 @@ int32_t mirror_shm_create(const char *name, uint32_t size, int32_t level_api) {
     }
 
     return fd;
+#endif
 }
 
 void *mirror_get_fixed_page_ptr(void) {
@@ -154,7 +184,7 @@ int32_t mirror_remap_pages_16k(bus_t *bus, uint8_t *param_2, uint64_t param_3, i
         int32_t  fd  = bus->shared_region_fd;
         uint32_t off = (uint32_t)param_4 + (uint32_t)i;
 
-        void *r = map(addr, 0x4000, 3, 1, fd, (int64_t)off);
+        void *r = map(addr, 0x4000, 3, MIRROR_MAP_REMAP, fd, (int64_t)off);
         if (r != addr) return -1;
     }
 
@@ -182,7 +212,7 @@ int mirror_alias_blocks_16k(bus_t *bus, uint8_t *base, unsigned size,
 
         int fd = bus->vram_region_fd;
         uint32_t offset = offset_base + (uint32_t)shift;
-        void *r = p_mmap(dir, BLOCK, 3, 1, fd, (long)(uint64_t)offset);
+        void *r = p_mmap(dir, BLOCK, 3, MIRROR_MAP_REMAP, fd, (long)(uint64_t)offset);
 
         if (r != (void *)dir) return -1;
     }
@@ -382,7 +412,7 @@ static void mirror_window_4mb(uint8_t *ctx, uint8_t *base_window) {
         p_munmap(dest, 0x4000);
         int32_t fd = ((bus_t *)ctx)->shared_region_fd;
         void *obtained = p_mmap(dest, 0x4000, 3 ,
-                                 1 , fd, (long)off);
+                                 MIRROR_MAP_REMAP, fd, (long)off);
         if (obtained != (void *)dest) {
             p_perror(MSG_ERROR_IS);
             break;
@@ -468,7 +498,7 @@ int32_t mirror_memory_subsystem_create(uint8_t *param_1, uint8_t *param_2) {
             uint8_t *dest = base + off;
             p_munmap(dest, 0x4000);
             int32_t fd_now = bus->shared_region_fd;
-            void *obtained = p_mmap(dest, 0x4000, 3, 1, fd_now, 0);
+            void *obtained = p_mmap(dest, 0x4000, 3, MIRROR_MAP_REMAP, fd_now, 0);
             if (obtained != (void *)dest) { p_exit(-1); return -1; }
             off += 0x4000UL;
         } while (off < 0x4000000UL);

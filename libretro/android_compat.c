@@ -49,3 +49,8 @@ void *memalign(size_t alignment, size_t size)
 void seedless_compat_init(void)
 {
 }
+
+/* Android platform (crash.c) is skipped for libretro; input.c still calls this. */
+void platform_config_record_reset(void)
+{
+}

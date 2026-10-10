@@ -104,6 +104,32 @@ size_t seedless_audio_read(int16_t *out, size_t max_frames)
     return got;
 }
 
+/* Release OpenSL buffer-queue backpressure after libretro consumes PCM.
+ * buffer_samples counts int16 values (2 per stereo frame). */
+void seedless_audio_mark_consumed(size_t frames)
+{
+    static size_t s_acc;
+    uint32_t samples_per_buf;
+    uint32_t frames_per_buf;
+
+    if (frames == 0 || PLATFORM_AUDIO->active == 0)
+        return;
+
+    samples_per_buf = PLATFORM_AUDIO->buffer_samples;
+    if (samples_per_buf < 2)
+        return;
+    frames_per_buf = samples_per_buf / 2u;
+
+    s_acc += frames;
+    while (s_acc >= frames_per_buf) {
+        s_acc -= frames_per_buf;
+        if (PLATFORM_AUDIO->queued > 0)
+            PLATFORM_AUDIO->queued--;
+        else
+            break;
+    }
+}
+
 typedef struct sl_obj sl_obj_t;
 
 struct sl_obj {
@@ -159,10 +185,10 @@ static SLresult obj_get_state(void *self, SLuint32 *state)
 static SLresult bq_enqueue(void *self, const void *buffer, SLuint32 size)
 {
     (void)self;
+    /* Only capture PCM. queued is owned by feed_frame / mark_consumed
+     * (real OpenSL decrements via RegisterCallback after the buffer plays). */
     if (buffer && size)
         ring_write_bytes(buffer, size);
-    if (PLATFORM_AUDIO->queued > 0)
-        PLATFORM_AUDIO->queued--;
     return 0;
 }
 

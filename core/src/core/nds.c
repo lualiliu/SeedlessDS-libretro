@@ -46,7 +46,8 @@ int nds_start_game(nds_start_params_t *params) {
     arm(((nds_t *)G)->save_dir, 0, fmt, params->save_dir);
 
     ((nds_t *)G)->bus.address_window = (uint8_t *)(uintptr_t)(uint64_t)-1;
-    nds_machine_init(G);
+    if (nds_machine_init(G) != 0)
+        return -1;
 
     uint32_t mode = params->texture_format;
     ((nds_t *)G)->runtime.texture_format = (unsigned char)mode;
@@ -88,7 +89,7 @@ int nds_start_game(nds_start_params_t *params) {
     return 0;
 }
 
-void nds_machine_init(unsigned char *obj) {
+int nds_machine_init(unsigned char *obj) {
 
     script_lua_init(obj);
     script_io_init();
@@ -104,8 +105,8 @@ void nds_machine_init(unsigned char *obj) {
 
     unsigned char *map = (unsigned char *)&((nds_t *)obj)->bus;
     if (mirror_memory_subsystem_create(map, obj) < 0) {
-        mirror_fatal_reset_longjmp(obj);
-        return;
+        /* setjmp for fatal_jump is armed only after init; do not longjmp here. */
+        return -1;
     }
 
     gpu2d_worker_init((unsigned char *)&((nds_t *)obj)->gpu, map);
@@ -121,7 +122,7 @@ void nds_machine_init(unsigned char *obj) {
     ((nds_t *)obj)->rom_file_name[0] = 0;
     ((nds_t *)obj)->rom_name[0] = 0;
     ((nds_t *)obj)->benchmark.enabled = 0;
-    #undef LL
+    return 0;
 }
 
 void nds_machine_reset(unsigned char *machine) {

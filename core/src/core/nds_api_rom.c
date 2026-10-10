@@ -157,7 +157,9 @@ int nds_load_rom(nds_t *nds, const nds_rom_open_t *open)
     }
 
     memset(&params, 0, sizeof params);
-    params.cache_dir = DATA_SYSTEM_DIR;
+    /* libretro installs BIOS at {SEEDLESS_ROOT}/User/system/; files_read
+     * builds "{cache_dir}/system/<name>", then posix resolve prefixes SEEDLESS_ROOT. */
+    params.cache_dir = DATA_USER_DIR;
     params.save_dir = DATA_USER_DIR;
     params.rom_path = open->path;
     params.machine_slot = &g->machine;

@@ -1,6 +1,7 @@
-/* Placeholder CPU backend for non-AArch64 hosts.
+/* Placeholder CPU / JIT symbols for non-AArch64 hosts.
  * Seedless-core currently only ships an AArch64 JIT; x86_64 cannot emulate. */
 
+#include <stdint.h>
 #include <stdio.h>
 #include "seedlessds/cpu_backend.h"
 
@@ -59,4 +60,69 @@ const cpu_backend_t *nds_cpu_backend_jit_arm64(void)
 const cpu_backend_t *nds_cpu_backend_default(void)
 {
     return &stub;
+}
+
+/* Symbols normally provided by jit-arm64/cache.c + memhooks.S */
+
+void jit_arena_protect_rwx(unsigned char *base)
+{
+    (void)base;
+}
+
+void jit_arena_regions_init(unsigned char *arena)
+{
+    (void)arena;
+}
+
+void *jit_cache_lookup_or_compile(void *ctx, uint32_t dir)
+{
+    (void)ctx;
+    (void)dir;
+    return NULL;
+}
+
+void jit_cache_refresh_block_info(unsigned char *ctx)
+{
+    (void)ctx;
+}
+
+int32_t jit_cache_flush(uint8_t *ctx, uint32_t arg)
+{
+    (void)ctx;
+    (void)arg;
+    return 0;
+}
+
+uint32_t jit_watch_write8(unsigned char *machine, uint32_t dir)
+{
+    (void)machine;
+    (void)dir;
+    return 1;
+}
+
+uint32_t jit_watch_write16(unsigned char *machine, uint32_t dir)
+{
+    (void)machine;
+    (void)dir;
+    return 1;
+}
+
+uint32_t jit_watch_write32(unsigned char *machine, uint32_t dir)
+{
+    (void)machine;
+    (void)dir;
+    return 1;
+}
+
+/* memhooks.S tail-call into JIT dispatcher; unused without AArch64 JIT. */
+void script_lua_register_dual_slot_tail(void *a0, uint64_t a1)
+{
+    (void)a0;
+    (void)a1;
+}
+
+/* LZMA 7zCrc.c (x86) expects this from CpuArch.c, which we do not build. */
+int CPU_Is_InOrder(void)
+{
+    return 1;
 }

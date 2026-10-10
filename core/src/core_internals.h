@@ -74,7 +74,7 @@ struct arm_debug;
 void arm_debug_reset(struct arm_debug *debug);
 int nds_close_files(cart_t *cart);
 unsigned long nds_loading_percent(void);
-void nds_machine_init(unsigned char *obj);
+int nds_machine_init(unsigned char *obj);
 void nds_machine_reset(unsigned char *machine);
 int nds_sprintf_limited(char *dest, size_t size, const char *format, ...);
 void nds_subsystem_hook_noop(void);
